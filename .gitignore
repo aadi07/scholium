@@ -1,0 +1,39 @@
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Node / SvelteKit ──────────────────────────────────────────────────────────
+node_modules/
+/build
+/.svelte-kit
+/package
+
+# ── Environment variables ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Vite ──────────────────────────────────────────────────────────────────────
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# ── Rust / Cargo ──────────────────────────────────────────────────────────────
+src-tauri/target/
+
+# ── Tauri ─────────────────────────────────────────────────────────────────────
+# Compiled sidecar binaries (built locally, not committed)
+src-tauri/bin/ocr-helper
+src-tauri/bin/ocr-helper-*
+
+# ── Editor tooling ────────────────────────────────────────────────────────────
+# VSCode — commit .vscode/extensions.json or launch.json manually if desired
+.vscode/
+
+# ── AI assistant configs ──────────────────────────────────────────────────────
+# These are local AI context files, not project source
+.claude/
+.cursor/
+.gemini/
+.aider*
+.continue/

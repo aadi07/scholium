@@ -247,6 +247,11 @@
       }));
 
       loading = false;
+      // Fire onActivePage(1) immediately so the parent can pre-fetch page 1 text
+      // before the user sends a message. checkVisiblePages only fires when the
+      // page changes, so this explicit call handles the initial load case.
+      activePage = 0; // reset so checkVisiblePages triggers on first run
+      onActivePage?.(1);
       setTimeout(() => checkVisiblePages(), 50);
     } catch (e) {
       if (currentLoadId === myLoadId) {
@@ -556,6 +561,86 @@
   export function zoomOut() {
     scale = Math.max(scale - 0.25, 0.5);
     void rerenderCurrentDocument();
+  }
+
+  /**
+   * Extract the full plain text of a given page directly from the in-memory
+   * pdf.js document object. This is DOM-independent and always up-to-date.
+   * Returns empty string if the doc isn't loaded yet.
+   */
+  /**
+   * Render a page to an offscreen canvas and return it as a base64 PNG data URL.
+   * Used to send the page image to a vision-language model.
+   */
+  export async function getPageImage(pageNum: number, renderScale = 2): Promise<string> {
+    if (!pdfDoc) return '';
+    try {
+      const page = await pdfDoc.getPage(pageNum);
+      const viewport = page.getViewport({ scale: renderScale });
+
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.floor(viewport.width);
+      canvas.height = Math.floor(viewport.height);
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) { page.cleanup(); return ''; }
+
+      await page.render({ canvasContext: ctx, canvas, viewport }).promise;
+      page.cleanup();
+
+      return canvas.toDataURL('image/png');
+    } catch (e) {
+      console.warn('[getPageImage] failed:', e);
+      return '';
+    }
+  }
+
+  export async function getPageText(pageNum: number): Promise<string> {
+    if (!pdfDoc) return '';
+    try {
+      const page = await pdfDoc.getPage(pageNum);
+      const content = await page.getTextContent();
+      page.cleanup();
+
+      if (content.items.length === 0) return '';
+
+      // Reconstruct reading order using spatial coordinates from the PDF transform.
+      // Each item has transform[4]=x, transform[5]=y (PDF space, y increases upward).
+      // We group items by Y position (within half a line-height tolerance), sort groups
+      // top-to-bottom, and sort items within each group left-to-right. This preserves
+      // line structure for prose and keeps math symbols on the same line as their operators.
+      type LineItem = { x: number; str: string };
+      const groups: { y: number; items: LineItem[] }[] = [];
+
+      for (const raw of content.items) {
+        if (!('str' in raw) || !raw.str) continue;
+        const item = raw as any;
+        const x: number = item.transform[4];
+        const y: number = item.transform[5];
+        const height: number = item.height || 10;
+        const tolerance = Math.max(height * 0.5, 3);
+
+        const group = groups.find(g => Math.abs(g.y - y) <= tolerance);
+        if (group) {
+          group.items.push({ x, str: item.str });
+        } else {
+          groups.push({ y, items: [{ x, str: item.str }] });
+        }
+      }
+
+      // Sort groups top-to-bottom (highest Y value = top of page in PDF coords)
+      groups.sort((a, b) => b.y - a.y);
+
+      const lines = groups.map(g => {
+        g.items.sort((a, b) => a.x - b.x);
+        return g.items.map(i => i.str).join('');
+      });
+
+      return lines.filter(l => l.trim()).join('\n');
+    } catch (e) {
+      console.warn('[getPageText] failed:', e);
+      return '';
+    }
   }
 </script>
 

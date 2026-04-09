@@ -3448,6 +3448,7 @@ name = "scholium"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "dirs",
  "futures-util",
  "reqwest 0.12.28",
  "rusqlite",

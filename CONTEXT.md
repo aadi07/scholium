@@ -6,7 +6,7 @@
 > (or any collaborating AI assistant) before continuing development, so that no
 > decision needs to be re-litigated and no context is lost.
 >
-> Last updated: after thread panel design and canvas selection architecture were finalized.
+> Last updated: after V1 page-level AI, vision model integration, KaTeX, chat persistence, DB architecture fixes, and research workflow improvement planning (semantic retrieval, learning modes, model routing, annotation persistence).
 
 ---
 
@@ -154,8 +154,23 @@ opt into their own API key.
 |---|---|---|
 | llama3.1:8b | ~5GB | Strong general reasoning, good default |
 | deepseek-r1:8b | ~5GB | Strong reasoning, good for technical/math |
-| qwen2.5:7b | ~5GB | Notably strong at STEM and math |
+| qwen2.5:7b | ~5GB | Notably strong at STEM and math. Good fast-path routing target. |
 | llama3.1:70b | ~40GB | Near-frontier, needs serious hardware |
+| nomic-embed-text | ~300MB | Embedding model for semantic retrieval (v2). Runs via Ollama. |
+
+### Model Routing (v2)
+Route by task to balance quality and latency. Suggested routing strategy:
+
+| Task | Suggested Model |
+|---|---|
+| Quick definition / terminology lookup | qwen2.5:7b or equivalent small model |
+| Deep explanation / proof walkthrough | Primary model (e.g. gemma4:26b) |
+| Background chunk embedding | nomic-embed-text (fire-and-forget at load time) |
+| Summarization job | Small model sufficient; does not need frontier quality |
+
+Surface a user-visible hint for queries that would genuinely benefit from a frontier
+model: "This looks complex — consider enabling your Anthropic key for this query."
+Do not route silently without user awareness.
 
 ### Settings Panel
 ```
@@ -410,12 +425,16 @@ For each AI query, context assembled in this order (later = closer to model atte
 1. Project system_note — user-set domain context
 2. Relevant KB entries — concepts previously worked through (keyword/recency in v1,
    semantic search in v2)
-3. Document text window — +/- N pages around the anchor (N from settings, default 2),
-   sliced from text_cache
-4. Thread summary — rolling mutual understanding summary of prior conversation
-5. Recent verbatim messages — last 8 (configurable)
-6. Anchor quote — selected passage, explicitly flagged in system prompt
-7. User's new message
+3. **[CRITICAL — v2] Semantically retrieved chunks** — top-k chunks from across the
+   entire document (or project), retrieved by embedding similarity to the user's query.
+   This is the highest-leverage improvement to context quality. See Section 25.
+4. Document text window — +/- N pages around the anchor (N from settings, default 2),
+   sliced from text_cache. The sliding window provides local coherence; semantic
+   retrieval provides non-local relevance. Both are needed.
+5. Thread summary — rolling mutual understanding summary of prior conversation
+6. Recent verbatim messages — last 8 (configurable)
+7. Anchor quote — selected passage, explicitly flagged in system prompt
+8. User's new message
 
 System prompt instructs: be precise and rigorous, calibrate to user's apparent level,
 use LaTeX notation, cite specific parts of the provided text.
@@ -452,7 +471,7 @@ Actual risks and mitigations:
 | AI context cached per thread | Never cache assembled context. Assemble at query time. |
 | text_cache duplicated per thread | Stored once per document, shared across all threads. |
 | OCR layout JSON | ~5MB per document. Acceptable. Stored in documents.ocr_layout. |
-| Vector embeddings (v2) | ~4MB per document. Defer to v2. |
+| Vector embeddings (v2, semantic retrieval) | ~4MB per document for chunk vectors. Store in SQLite as BLOB or separate `embeddings` table. Acceptable. **Critical for v2 — do not defer beyond it.** |
 | Long thread verbatim history | Summarization distills old messages. Keep last N verbatim. |
 
 ---
@@ -742,8 +761,9 @@ Improve before v1 ships.
 Cross-document context: architecture supports it (project-scoped KB) but prompt
 assembly only windows a single document's text. Cross-document injection is v2.
 
-Semantic KB retrieval: v1 uses keyword/recency match. v2 should use vector embeddings
-(fastembed or local model) for semantic retrieval.
+Semantic KB retrieval: v1 uses keyword/recency match. **v2 MUST use vector embeddings
+(fastembed or nomic-embed-text via Ollama) for semantic retrieval — this is the
+highest-priority v2 improvement.** See Section 25 for full architecture.
 
 Thread marker y-positioning: if a highlight is off-screen (user has scrolled past
 it), the collapsed marker should still be visible. Consider a fixed right-margin
@@ -760,6 +780,15 @@ Export: thread or project export as markdown/PDF. Natural v2 feature.
 Project-level chat: a thread not anchored to any passage, for synthesis questions
 across a project. Schema supports it via a virtual document concept. Deferred.
 
+Learning mode selector: Interrogation (Socratic), Formalization (mathematical
+precision), Devil's Advocate (steelman + challenge), Connection (analogical
+reasoning). These are system prompt variants — low implementation cost, high
+pedagogical value. Deferred to after thread anchoring is complete.
+
+Structured concept index: background pass at document load that extracts definitions,
+theorems, and named results into a sidebar index. Each entry is clickable — jumps to
+page and opens a pre-seeded thread. Builds naturally on the KB architecture. Deferred.
+
 ---
 
 ## 21. Things Explicitly Decided Against
@@ -767,7 +796,7 @@ across a project. Schema supports it via a virtual document concept. Deferred.
 | Feature | Reason |
 |---|---|
 | Graph/link views | Obsidian territory, scope creep, contradicts minimal aesthetic |
-| Flashcards / SRS | Different product, dilutes focus |
+| Flashcards / SRS | Different product, dilutes focus. However, the SQLite annotation schema naturally seeds a future Anki export (.apkg) as a v3 feature — thread-level engagement depth (long conversations, explicit "mark for review") drives card selection. Do not build now; keep schema compatible. |
 | Heavyweight note editor | Threads are conversational, not documents |
 | Copying PDFs into app data | Storage explosion, reference path only |
 | Caching assembled AI context | Storage explosion, assemble at query time |
@@ -776,6 +805,122 @@ across a project. Schema supports it via a virtual document concept. Deferred.
 | Tesseract for OCR | ~20MB binary bloat, macOS Vision is higher quality and free |
 | Tags on documents or threads | KB provides cross-cutting organization, manual tags duplicate effort |
 | Ads or usage metering | Antithetical to the product's value proposition |
+
+---
+
+## 25. Semantic Retrieval Layer (CRITICAL — v2 Top Priority)
+
+This is the highest-ROI improvement to Scholium's AI quality and the most important
+v2 engineering investment. Keyword/recency KB retrieval works for simple lookups but
+fails badly on cross-document and non-local reasoning. A reader asking "how does this
+connect to the theorem in chapter 3?" needs cross-document grounding, not a page window.
+
+### Why This Is Critical
+The current page-window context (±2 pages) is purely local. Dense technical texts —
+precisely Scholium's target corpus — are full of non-local dependencies: forward
+references, proof callbacks, notation defined 40 pages earlier. A semantic index
+makes the *entire document* latently present in every query, not just the neighborhood.
+This transforms answer quality for any non-trivial question.
+
+### Architecture
+
+**Chunking Strategy**
+At document load time (after OCR waterfall completes), chunk text_cache into
+overlapping segments for embedding:
+- Chunk size: ~400 tokens (~300 words)
+- Overlap: ~80 tokens (prevents context loss at chunk boundaries)
+- Store chunks in a new `chunks` table with (document_id, chunk_index, page_number, text)
+
+**Embedding Model**
+Use `nomic-embed-text` via Ollama — small (~300MB), high quality for retrieval,
+runs locally with no API key required. Embedding dimension: 768.
+Embed each chunk immediately after chunking. Store as BLOB in `chunks.embedding`.
+
+**Retrieval at Query Time**
+1. Embed the user's query using the same model (single fast inference call)
+2. Compute cosine similarity between query vector and all chunk embeddings for the document
+3. Return top-k chunks (k=5 default, configurable) above a similarity threshold
+4. Inject retrieved chunks into the context stack at position 3 (see Section 11)
+
+For project-scope retrieval (cross-document), run the same process across all
+documents in the project. Rank globally and take top-k.
+
+**Rust Implementation Sketch**
+```rust
+// New table
+CREATE TABLE chunks (
+    id          TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    page_number INTEGER NOT NULL,
+    text        TEXT NOT NULL,
+    embedding   BLOB,  -- f32 array serialized as little-endian bytes
+    created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+// Cosine similarity in Rust (no DB extension needed)
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    dot / (norm_a * norm_b)
+}
+```
+
+**Embedding API Call (Ollama)**
+```
+POST http://localhost:11434/api/embeddings
+{ "model": "nomic-embed-text", "prompt": "<chunk text>" }
+-> { "embedding": [f32, ...] }
+```
+Fire-and-forget in a background tokio task after document load. Show subtle progress
+indicator ("Indexing document for semantic search...") — never block the UI.
+
+**Settings**
+```
+semantic_retrieval_enabled  -> true (default once v2 ships)
+semantic_k                  -> 5 (top-k chunks injected)
+semantic_threshold          -> 0.65 (minimum cosine similarity)
+embed_model                 -> "nomic-embed-text"
+```
+
+**Storage Cost**
+768 floats × 4 bytes × ~500 chunks (300-page textbook) ≈ ~1.5MB per document.
+Acceptable. See Section 13.
+
+**Degradation Path**
+If Ollama is unavailable or the embedding model is not pulled, fall back silently to
+keyword/recency retrieval with a settings-panel warning. Never hard-fail a query
+because semantic indexing is not ready.
+
+### Why Not sqlite-vec or a Dedicated Vector DB
+sqlite-vec is a strong option for purely in-process ANN search (no HTTP call). Worth
+evaluating if the cosine-over-all-chunks approach becomes a bottleneck at large
+document counts. For v2, brute-force cosine is fine — even 5,000 chunks completes
+in <10ms in Rust. Defer ANN until there is a measured performance problem.
+
+---
+
+## 26. Learning Modes (v2, After Thread Anchoring Ships)
+
+Different research tasks call for different model behaviors. A mode selector in the
+thread panel header (small icon row, not a dropdown) switches the system prompt
+variant for that thread. Modes are stored per-thread so cold return restores the
+original intent.
+
+| Mode | System Prompt Behavior | Best For |
+|---|---|---|
+| **Default** | Rigorous, calibrated, prose-first explanation | General comprehension |
+| **Interrogation** | Model asks Socratic questions rather than answering directly. Withholds resolution until the user has reasoned toward it. | Active recall, exam prep |
+| **Formalization** | Model expresses the passage's claims in precise mathematical or logical notation, then explains the translation. | Proof comprehension, notation fluency |
+| **Devil's Advocate** | Model steelmans the argument, then identifies its strongest objections or edge cases. | Critical reading, research evaluation |
+| **Connection** | Model surfaces structural analogies to concepts in other domains the user is likely to know. | Building intuition, cross-domain transfer |
+
+These are purely system prompt variants — implementation cost is minimal. The UI
+affordance (mode icon row in thread header) is the main design work.
+
+Mode changes mid-thread are allowed but the model should acknowledge the switch
+explicitly ("Switching to Devil's Advocate mode — let me reframe what we just covered...").
 
 ---
 
@@ -810,5 +955,67 @@ Despite returning flawless mathematical coordinates, creating standard HTML `<sp
 
 ---
 
+## 24. V1 Current Implementation State
+
+This section documents what is **actually built and running** in V1, which differs from the full architecture described above (the above remains the target). Read this section to understand the current state before making changes.
+
+### AI Model
+
+The current model is `gemma4:26b` via Ollama (`http://localhost:11434`). Gemma 4 is natively multimodal and accepts image input alongside text. The model constant lives in `src-tauri/src/commands/messages.rs`.
+
+### Page-Level AI (Not Yet Thread-Anchored)
+
+V1 uses a simplified "page chat" model rather than passage-anchored threads:
+
+- There is **one persistent chat per document**, keyed by `file_path` as the `thread_id`.
+- When a document is opened, `load_messages(file_path)` restores the full prior conversation from SQLite.
+- The AI receives the **rendered page image** (base64 PNG) of the currently visible page on every query — not extracted text. This gives the vision model full fidelity including math, figures, and layout.
+- Page images are captured via `getPageImage()` in `PdfViewer.svelte`, which renders the page offscreen at 2× scale and returns a data URL.
+- The "thread" concept in the DB is not yet used for anchoring — threads/messages are stored under the file path as a pseudo thread_id.
+
+The full selection → anchor → thread panel flow described in sections 8–11 is **not yet implemented**. That is the next major build phase.
+
+### Database Architecture Fix
+
+The original `get_conn()` pattern (new `Connection` per call) caused a `SQLITE_BUSY` deadlock. The fix:
+
+- `DbConn` wraps `Arc<Mutex<Connection>>` (previously a bare `Mutex`, changed to Arc for cross-thread cloning).
+- Initialized once in `lib.rs::run()` via `db::open()`, registered as Tauri managed state.
+- All commands receive `db: State<'_, DbConn>` and lock via `db.0.lock()`.
+- The spawned async streaming task clones the Arc to persist the completed assistant message after the stream ends.
+- WAL mode enabled (`PRAGMA journal_mode=WAL`) with a 5-second busy timeout.
+
+### DB File Location
+
+The database is stored at `~/Library/Application Support/scholium/scholium.db` (via `dirs::data_dir()`), **not** inside `src-tauri/`. Storing it inside `src-tauri/` caused Tauri's dev watcher to detect `.db-shm` writes as file changes and enter an infinite rebuild loop.
+
+### Math Rendering (KaTeX)
+
+KaTeX is installed and integrated in `src/routes/+page.svelte`:
+
+- `formatMessage()` splits on `$$...$$` (display) and `$...$` (inline) before HTML-escaping, renders each with `katex.renderToString()`, then markdown-processes plain text segments.
+- The system prompt instructs the model to always wrap math in LaTeX delimiters and write conversational prose (no bullet walls).
+- A LaTeX snippet toolbar above the input provides one-click insertion of common symbols (frac, ∫, Σ, √, lim, ∞, ±, ×).
+- The input textarea uses `font-mono` so LaTeX source is readable while composing.
+
+Note: the model was observed outputting `\(` / `\)` delimiters (LaTeX display style) rather than `$` / `$$`. The system prompt has been tuned to enforce `$` delimiters, but if this regresses the `formatMessage` regex may need extending to handle `\(...\)` and `\[...\]` as well.
+
+### Improved Text Extraction (Spatial Grouping)
+
+`getPageText()` in `PdfViewer.svelte` was rewritten to reconstruct reading order from pdf.js transform coordinates:
+
+- Groups text items by Y position (within `height * 0.5` tolerance) → same visual line.
+- Sorts groups top-to-bottom (descending Y in PDF coordinate space).
+- Sorts items within each group left-to-right by X.
+- Joins items within a line without extra spaces; newline between lines.
+
+This is currently used as a fallback only — V1 sends the page image to the vision model, making text extraction secondary.
+
+### System Prompt Philosophy
+
+The system prompt instructs the model to be rigorous but conversational — "the way a knowledgeable friend talks." Prose is strongly preferred over bullet lists and headers. Filler phrases ("Certainly!", "Great question!") are explicitly forbidden. LaTeX is required for all math.
+
+---
+
 End of CONTEXT.md
-Updated after: canvas selection architecture, SVG sub-pixel highlighting, mathematical virtualization, and dual-layer native AppKit/Vision fallback routing were established.
+Updated after: V1 page-level AI, vision model (gemma4:26b), KaTeX math rendering, chat persistence, Arc<Mutex> DB fix, DB relocation, dev watcher crash loop fix, and v2 research workflow planning (semantic retrieval architecture, learning modes, model routing, annotation persistence hooks).

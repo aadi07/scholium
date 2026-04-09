@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use tauri::State;
+use crate::db::DbConn;
 
 #[derive(Deserialize)]
 pub struct CreateThreadPayload {
@@ -23,13 +25,13 @@ pub struct Thread {
 }
 
 #[tauri::command]
-pub fn create_thread(payload: CreateThreadPayload) -> Result<Thread, String> {
-    // Generate id + timestamps
+pub fn create_thread(db: State<'_, DbConn>, payload: CreateThreadPayload) -> Result<Thread, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();
 
-    // Persist to SQLite
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
     match crate::db::insert_thread(
+        &conn,
         &id,
         &payload.document_id,
         payload.page_number as i64,

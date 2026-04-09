@@ -3,9 +3,13 @@
   import PdfViewer from '$lib/components/PdfViewer.svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, tick } from 'svelte';
   import { app } from '$lib/stores/app.svelte';
-  import type { TextSelection, Thread } from '$lib/types';
+  import type { TextSelection } from '$lib/types';
+  import katex from 'katex';
+  import 'katex/dist/katex.min.css';
+
+  let pdfViewer = $state<{ getPageImage: (n: number, scale?: number) => Promise<string>; getPageText: (n: number) => Promise<string>; zoomIn: () => void; zoomOut: () => void } | null>(null);
 
   // ─── File open ─────────────────────────────────────────────────────────────
 
@@ -30,38 +34,52 @@
     app.activeSelection = null;
     app.activeThread = null;
     activePage = 1;
-    pageContextText = '';
+    cachedPageImage = '';
     messages = [];
     streamingBuffer = '';
+    streaming = false;
+    // Use file path as stable thread ID so history persists across sessions
+    pageThreadId = path;
+    await loadHistory(path);
+  }
+
+  async function loadHistory(threadId: string) {
+    try {
+      const rows = await invoke<{ id: string; thread_id: string; role: string; content: string; created_at: number }[]>(
+        'load_messages', { threadId }
+      );
+      messages = rows;
+      await scrollToBottom();
+    } catch (e) {
+      console.warn('[history] failed to load:', e);
+    }
   }
 
   // ─── Page-level AI state ────────────────────────────────────────────────────
 
   let activePage = $state(1);
-  let pageContextText = $state('');
-  let aiPanelOpen = $state(false);  // auto-opens when doc is loaded
+  // Eagerly cached rendered image (base64 PNG) for the active page
+  let cachedPageImage = $state('');
 
-  function handleActivePage(pageNum: number) {
+  async function handleActivePage(pageNum: number) {
     activePage = pageNum;
-    // Reset context — will be grabbed fresh when user sends a message
-    pageContextText = '';
+    cachedPageImage = '';
+    await tick();
+
+    if (pdfViewer) {
+      try {
+        cachedPageImage = await pdfViewer.getPageImage(pageNum);
+        console.log(`[page ${pageNum}] image captured: ${cachedPageImage.length} chars`);
+      } catch (e) {
+        console.warn('[page image] failed:', e);
+      }
+    }
   }
 
   function handlePageCount(count: number) {
     if (app.activeDocument) {
       app.activeDocument = { ...app.activeDocument, page_count: count };
     }
-    aiPanelOpen = true;
-  }
-
-  /** Extract visible text from the currently active pdf-page DOM node */
-  function extractPageText(pageNum: number): string {
-    const pageEl = document.querySelector(`[data-page-number="${pageNum}"]`);
-    if (!pageEl) return '';
-    // Grab text from the native pdf.js textLayer spans
-    const textLayer = pageEl.querySelector('.textLayer');
-    if (!textLayer) return '';
-    return (textLayer as HTMLElement).innerText ?? textLayer.textContent ?? '';
   }
 
   // ─── Selection handling (preserved for future thread anchoring) ─────────────
@@ -76,43 +94,50 @@
   let outgoing = $state('');
   let streamingBuffer = $state('');
   let streaming = $state(false);
+  let messagesContainer = $state<HTMLDivElement | undefined>(undefined);
   let tokenUnlisten: (() => void) | null = null;
   let doneUnlisten: (() => void) | null = null;
   let errorUnlisten: (() => void) | null = null;
-  let messagesEnd: HTMLDivElement;
 
-  // Page-level thread ID — one ephemeral conversation per session per document
-  // (not persisted across restarts for V1, just in-memory)
+  // Token accumulation buffer — drains into streamingBuffer on a rAF tick
+  // to avoid hammering Svelte's reactivity with hundreds of micro-updates/sec
+  let pendingTokens = '';
+  let rafPending = false;
+
+  function flushTokens() {
+    rafPending = false;
+    if (pendingTokens) {
+      streamingBuffer += pendingTokens;
+      pendingTokens = '';
+    }
+  }
+
+  // Per-session thread ID — reset on each document open
   let pageThreadId = $state<string>(crypto.randomUUID());
 
-  $effect(() => {
-    // Reset conversation when document changes
-    if (app.activeDocument) {
-      pageThreadId = crypto.randomUUID();
-      messages = [];
-      streamingBuffer = '';
-      streaming = false;
-    }
-  });
-
-  $effect(() => {
-    // Auto-scroll to bottom when new content arrives
-    if (messagesEnd && (messages.length > 0 || streamingBuffer)) {
-      messagesEnd.scrollIntoView({ behavior: 'smooth' });
-    }
-  });
+  // Scroll to bottom of message list (called manually, not via $effect)
+  async function scrollToBottom() {
+    await tick();
+    messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
+  }
 
   onMount(async () => {
     const tokenListener = await listen('ai://token', (e) => {
       const payload = e.payload as any;
       if (payload.thread_id !== pageThreadId) return;
-      streamingBuffer += payload.token;
+      // Batch tokens — flush on next animation frame to avoid per-token DOM thrash
+      pendingTokens += payload.token;
+      if (!rafPending) {
+        rafPending = true;
+        requestAnimationFrame(flushTokens);
+      }
     });
 
     const doneListener = await listen('ai://done', (e) => {
       const payload = e.payload as any;
       if (payload.thread_id !== pageThreadId) return;
-      // Commit streamed content as a full message
+      // Flush any remaining pending tokens immediately
+      flushTokens();
       if (streamingBuffer.trim()) {
         messages = [...messages, {
           id: crypto.randomUUID(),
@@ -124,11 +149,13 @@
       }
       streamingBuffer = '';
       streaming = false;
+      void scrollToBottom();
     });
 
     const errorListener = await listen('ai://error', (e) => {
       const payload = e.payload as any;
       if (payload.thread_id !== pageThreadId) return;
+      pendingTokens = '';
       streaming = false;
       streamingBuffer = '';
       messages = [...messages, {
@@ -155,12 +182,9 @@
     if (!app.activeDocument || !outgoing.trim() || streaming) return;
 
     const userText = outgoing.trim();
+    const img = cachedPageImage || null;
     outgoing = '';
 
-    // Extract live page text right before sending
-    const ctx = extractPageText(activePage);
-
-    // Optimistically add user message to UI
     messages = [...messages, {
       id: crypto.randomUUID(),
       thread_id: pageThreadId,
@@ -169,16 +193,18 @@
       created_at: Date.now()
     }];
 
+    pendingTokens = '';
     streamingBuffer = '';
     streaming = true;
+    void scrollToBottom();
 
     try {
       await invoke('send_message', {
-        thread_id: pageThreadId,
+        threadId: pageThreadId,
         role: 'user',
         content: userText,
-        page_context: ctx,
-        page_number: activePage,
+        pageImage: img,
+        pageNumber: activePage,
       });
     } catch (e) {
       streaming = false;
@@ -198,7 +224,6 @@
       e.preventDefault();
       openFile();
     }
-    // Cmd+Enter or Ctrl+Enter to send
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
       const target = e.target as HTMLElement;
       if (target?.closest('.ai-input-area')) {
@@ -208,15 +233,89 @@
     }
   }
 
-  function formatMessage(content: string) {
-    // Very light markdown: bold, code spans, newlines
-    return content
+  function renderLatex(tex: string, display: boolean): string {
+    try {
+      return katex.renderToString(tex, { displayMode: display, throwOnError: false, output: 'html' });
+    } catch {
+      return display ? `$$${tex}$$` : `$${tex}$`;
+    }
+  }
+
+  function formatMessage(content: string): string {
+    // Split on display math ($$...$$) first, then inline ($...$), to avoid mis-parsing.
+    // Process in segments so we never HTML-escape inside LaTeX.
+    const segments: string[] = [];
+    let remaining = content;
+
+    // Match all common LaTeX delimiter styles (order matters — longer first):
+    //   \[...\]  display   (Qwen/ChatGPT style)
+    //   \(...\)  inline    (Qwen/ChatGPT style)
+    //   $$...$$  display   (Markdown style)
+    //   $...$    inline    (Markdown style)
+    const mathRe = /\\\[(.+?)\\\]|\\\((.+?)\\\)|\$\$(.+?)\$\$|\$(.+?)\$/gs;
+    let last = 0;
+    let m: RegExpExecArray | null;
+
+    while ((m = mathRe.exec(remaining)) !== null) {
+      // Text before this math chunk — sanitize and markdownify it
+      const before = remaining.slice(last, m.index);
+      segments.push(markdownToHtml(before));
+
+      const displayTex = m[1] ?? m[3]; // \[...\] or $$...$$
+      const inlineTex  = m[2] ?? m[4]; // \(...\) or $...$
+      if (displayTex !== undefined) {
+        segments.push(`<span class="katex-display-wrap">${renderLatex(displayTex, true)}</span>`);
+      } else if (inlineTex !== undefined) {
+        segments.push(renderLatex(inlineTex, false));
+      }
+      last = m.index + m[0].length;
+    }
+
+    segments.push(markdownToHtml(remaining.slice(last)));
+    return segments.join('');
+  }
+
+  function markdownToHtml(text: string): string {
+    return text
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
       .replace(/`([^`]+)`/g, '<code class="font-mono bg-white/10 px-1 rounded text-[11px]">$1</code>')
       .replace(/\n/g, '<br>');
+  }
+
+  // LaTeX snippet toolbar
+  const latexSnippets = [
+    { label: 'frac', insert: '\\frac{}{}' },
+    { label: '∫', insert: '\\int_{}^{}' },
+    { label: 'Σ', insert: '\\sum_{}^{}' },
+    { label: '√', insert: '\\sqrt{}' },
+    { label: 'lim', insert: '\\lim_{}' },
+    { label: '∞', insert: '\\infty' },
+    { label: '±', insert: '\\pm' },
+    { label: '×', insert: '\\times' },
+  ];
+
+  let textareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
+
+  function insertSnippet(snippet: string) {
+    if (!textareaEl) return;
+    const start = textareaEl.selectionStart;
+    const end = textareaEl.selectionEnd;
+    const before = outgoing.slice(0, start);
+    const after = outgoing.slice(end);
+    // Wrap selection or insert at cursor, surrounded by $...$
+    const selected = outgoing.slice(start, end);
+    const insertion = selected ? `$${snippet.replace('{}', `{${selected}`)}$` : `$${snippet}$`;
+    outgoing = before + insertion + after;
+    // Re-focus and place cursor inside the first {}
+    tick().then(() => {
+      if (!textareaEl) return;
+      const cursorPos = start + insertion.indexOf('{}') + 1;
+      textareaEl.focus();
+      textareaEl.setSelectionRange(cursorPos, cursorPos);
+    });
   }
 </script>
 
@@ -258,6 +357,7 @@
     <div class="flex-1 min-h-0">
       {#if app.activeDocument}
         <PdfViewer
+          bind:this={pdfViewer}
           filePath={app.activeDocument.file_path}
           threads={app.threads}
           onSelection={handleSelection}
@@ -314,12 +414,12 @@
       <div class="px-3 pt-3">
         <div class="flex items-center gap-1.5 text-[11px] text-zinc-500 bg-white/[0.03] border border-white/[0.06] rounded-lg px-3 py-2">
           <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-          <span>Discussing <strong class="text-zinc-300">{app.activeDocument.title}</strong>, page <strong class="text-zinc-300">{activePage}</strong></span>
+          <span>Page <strong class="text-zinc-300">{activePage}</strong> · <span class="{cachedPageImage ? 'text-green-500' : 'text-zinc-600'}">{cachedPageImage ? 'image ready' : 'loading…'}</span></span>
         </div>
       </div>
 
       <!-- Message list -->
-      <div class="flex-1 overflow-y-auto px-3 py-3 flex flex-col gap-3 min-h-0">
+      <div bind:this={messagesContainer} class="flex-1 overflow-y-auto px-3 py-3 flex flex-col gap-3 min-h-0">
         {#if messages.length === 0 && !streaming}
           <div class="flex flex-col items-center justify-center h-full gap-3 text-center select-none">
             <div class="w-10 h-10 rounded-xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center">
@@ -338,13 +438,13 @@
           {#if m.role === 'user'}
             <div class="flex justify-end">
               <div class="max-w-[85%] bg-indigo-600/80 rounded-2xl rounded-tr-sm px-3 py-2">
-                <p class="text-sm text-white leading-relaxed">{m.content}</p>
+                <p class="text-sm text-white leading-relaxed">{@html formatMessage(m.content)}</p>
               </div>
             </div>
           {:else}
             <div class="flex justify-start">
               <div class="max-w-[90%] bg-white/[0.04] border border-white/[0.06] rounded-2xl rounded-tl-sm px-3 py-2">
-                <!-- svelte-ignore a11y_no-static-element-interactions -->
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
                 <p class="text-sm text-zinc-200 leading-relaxed">{@html formatMessage(m.content)}</p>
               </div>
             </div>
@@ -355,7 +455,7 @@
         {#if streaming && streamingBuffer}
           <div class="flex justify-start">
             <div class="max-w-[90%] bg-white/[0.04] border border-white/[0.06] rounded-2xl rounded-tl-sm px-3 py-2">
-              <!-- svelte-ignore a11y_no-static-element-interactions -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
               <p class="text-sm text-zinc-200 leading-relaxed">{@html formatMessage(streamingBuffer)}</p>
             </div>
           </div>
@@ -370,18 +470,29 @@
           </div>
         {/if}
 
-        <div bind:this={messagesEnd}></div>
       </div>
 
       <!-- Input bar -->
       <div class="ai-input-area px-3 pb-3 flex-shrink-0 border-t border-white/[0.06] pt-3">
         <div class="flex flex-col gap-2">
+          <!-- LaTeX snippet toolbar -->
+          <div class="flex items-center gap-1 flex-wrap">
+            {#each latexSnippets as s}
+              <button
+                onclick={() => insertSnippet(s.insert)}
+                disabled={streaming}
+                class="px-1.5 py-0.5 text-[11px] font-mono text-zinc-400 bg-white/[0.04] border border-white/[0.06] rounded hover:bg-white/[0.08] hover:text-zinc-200 transition-colors disabled:opacity-40"
+                title={s.insert}
+              >{s.label}</button>
+            {/each}
+          </div>
           <textarea
+            bind:this={textareaEl}
             bind:value={outgoing}
             rows={3}
             disabled={streaming}
-            placeholder="Ask anything about page {activePage}… (⌘↵ to send)"
-            class="w-full bg-white/[0.04] border border-white/[0.08] rounded-xl p-3 text-sm text-zinc-200 placeholder-zinc-600 resize-none focus:outline-none focus:border-indigo-500/50 transition-colors disabled:opacity-50"
+            placeholder="Ask anything about page {activePage}… use $...$ for math (⌘↵ to send)"
+            class="w-full bg-white/[0.04] border border-white/[0.08] rounded-xl p-3 text-sm text-zinc-200 placeholder-zinc-600 resize-none focus:outline-none focus:border-indigo-500/50 transition-colors disabled:opacity-50 font-mono"
           ></textarea>
           <button
             onclick={sendMessage}
@@ -411,3 +522,17 @@
   </div>
 
 </div>
+
+<style>
+  :global(.katex-display-wrap .katex-display) {
+    margin: 0.4em 0;
+    overflow-x: auto;
+  }
+  :global(.katex-display-wrap .katex) {
+    color: #e2e8f0;
+  }
+  :global(.katex) {
+    color: #e2e8f0;
+    font-size: 1em;
+  }
+</style>
